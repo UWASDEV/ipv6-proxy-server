@@ -311,28 +311,18 @@ function check_ipv6(){
     log_err_and_exit "Error: IPv6 global address is not allocated on server, allocate it or contact your VPS/VDS support.";
   fi;
 
-  local ifaces_config="/etc/network/interfaces";
-  if [ ! -f $ifaces_config ]; then log_err "Potential error: interfaces config ($ifaces_config) doesn't exist"; fi;
-    
-  if grep 'inet6' $ifaces_config > /dev/null; then
-    echo "Network interfaces for IPv6 configured correctly";
-  else
-    log_err "Potential error: $ifaces_config has no inet6 (IPv6) configuration.";
-  fi;
-
   if [[ $(ping6 -c 1 google.com) != *"Network is unreachable"* ]] &> /dev/null; then 
     echo "Test ping google.com using IPv6 successfully";
   else
     log_err_and_exit "Error: test ping google.com through IPv6 failed, network is unreachable.";
   fi; 
-
 }
 
 # Install required libraries
 function install_requred_packages(){
   apt update &>> $script_log_file;
 
-  requred_packages=("make" "g++" "wget" "curl" "cron" "ndppd" "procps");
+  requred_packages=("make" "g++" "wget" "curl" "cron" "ndppd" "procps" "iproute2");
   for package in ${requred_packages[@]}; do install_package $package; done;
 
   echo -e "\nAll required packages installed successfully";
@@ -585,10 +575,13 @@ function create_startup_script(){
   # Script that adds all random ipv6 to default interface and runs backconnect proxy server
   ulimit -n 600000
   ulimit -u 600000
-  if [ $can_route_via_ndppd -eq 1 ]; then 
+  if [ $can_route_via_ndppd -eq 0 ]; then
+    ip -6 route add local $subnet_mask::/$subnet dev $interface_name 2>/dev/null
+  else
     for ipv6_address in \$(cat ${random_ipv6_list_file}); do ip -6 addr add \$ipv6_address dev $interface_name; done; 
   fi;
   ${user_home_dir}/proxyserver/3proxy/bin/3proxy ${proxyserver_config_path}
+  sleep 2
 
   # Kill old 3proxy daemon, if it's working
   for pid in "\${proxyserver_process_pids[@]}"; do
