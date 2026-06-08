@@ -13,7 +13,7 @@ Just run:
 ```bash
 #sudo su
 wget https://raw.githubusercontent.com/Temporalitas/ipv6-proxy-server/master/ipv6-proxy-server.sh && chmod +x ipv6-proxy-server.sh
-./ipv6-proxy-server.sh -s 64 -c 100 -u username -p password -t http -r 10
+./ipv6-proxy-server.sh -s 64 -c 1000 -u username -p password -t http -r 59
 ```
 
 Uncomment first line or run all commands with `sudo` if you`re not under root.
