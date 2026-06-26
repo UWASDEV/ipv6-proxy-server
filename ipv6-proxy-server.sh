@@ -243,6 +243,27 @@ function remove_ipv6_addresses_from_iface(){
   fi;
 }
 
+# Expand an IPv6 address (without prefix) into its 8 hextets, space-separated,
+# resolving "::" compression and omitted leading zeros. Zero groups become "0".
+# Needed so the subnet prefix is derived correctly even when the provider's
+# prefix itself contains zero/compressed groups (e.g. 2a01:4f8:c::1/64).
+function expand_ipv6(){
+  local ip="$1" left right miss i g; local L=() R=() out=() res=();
+  if [[ "$ip" == *"::"* ]]; then
+    left="${ip%%::*}"; right="${ip##*::}";
+    [ -n "$left" ] && IFS=':' read -ra L <<< "$left";
+    [ -n "$right" ] && IFS=':' read -ra R <<< "$right";
+    miss=$((8 - ${#L[@]} - ${#R[@]}));
+    out+=("${L[@]}");
+    for ((i=0; i<miss; i++)); do out+=("0"); done;
+    out+=("${R[@]}");
+  else
+    IFS=':' read -ra out <<< "$ip";
+  fi;
+  for g in "${out[@]}"; do g="${g#"${g%%[!0]*}"}"; [ -z "$g" ] && g=0; res+=("$g"); done;
+  echo "${res[*]}";
+}
+
 function get_subnet_mask(){
   if [ -z $subnet_mask ]; then
     # If we parse addresses from iface and want to use lower subnets, we need to clean existing proxy from interface before parsing
@@ -261,13 +282,17 @@ function get_subnet_mask(){
       ipv6=$(ip -6 addr | awk '{print $2}' | grep -m1 -oP '^(?!fe80)([0-9a-fA-F]{1,4}:)+[0-9a-fA-F]{1,4}' | cut -d '/' -f1);
     fi;
 
-    subnet_mask=$(echo $ipv6 | grep -m1 -oP '^(?!fe80)([0-9a-fA-F]{1,4}:){'$(($full_blocks_count-1))'}[0-9a-fA-F]{1,4}');
+    # Derive the subnet prefix from the FULLY EXPANDED address, so a compressed
+    # or zero-containing prefix (e.g. 2a01:4f8:c::1/64) still yields a correct
+    # mask. The previous regex returned an EMPTY mask for such prefixes, which
+    # produced malformed pool addresses and made every proxy dead.
+    read -ra expanded_blocks <<< "$(expand_ipv6 "$ipv6")";
+    subnet_mask="$(IFS=:; echo "${expanded_blocks[*]:0:$full_blocks_count}")";
     if [ $(expr $subnet % 16) -ne 0 ]; then
-      # Get last "uncomplete" block: if we want /68 subnet, get block from 64 to 80
-      block_part=$(echo $ipv6 | awk -v block=$(($full_blocks_count + 1)) -F ':' '{print $block}' | tr -d ' ');
-      # Because leading zeros can be skipped in the block, we need to add them if needed
+      # Append the needed high hex digits of the next (partial) block.
+      # E.g. for /72 we take 2 hex digits of block 5: (72 % 16) / 4 = 2.
+      block_part="${expanded_blocks[$full_blocks_count]}";
       while ((${#block_part} < 4)); do block_part="0$block_part"; done;
-      # Get part of block needed for subnet mask: if we want /72 subnet, we get 2 symbols - (72 (subnet) - 64 (full 4 blocks)) / 4 (2^4) in one hex digit
       symbols_to_include=$(echo $block_part | head -c $(($(expr $subnet % 16) / 4)));
       subnet_mask="$subnet_mask:$symbols_to_include";
     fi;
@@ -367,6 +392,29 @@ function configure_ipv6(){
     full_option="net.ipv6.$option=1";
     if ! cat /etc/sysctl.conf | grep -v "#" | grep -q $full_option; then echo $full_option >> /etc/sysctl.conf; fi;
   done;
+
+  # Reliability tuning for large IPv6 pools (address mode):
+  #  - Disable Duplicate Address Detection (DAD) on the proxy interface so freshly
+  #    added pool addresses become usable immediately instead of getting stuck in
+  #    "tentative"/"dadfailed". Many networks reflect neighbour solicitations or
+  #    have the gateway answer them, which makes DAD fail for addresses that are
+  #    legitimately ours - that is the main reason most pool addresses had no
+  #    connectivity. With DAD off, the kernel can answer NDP for every address.
+  #  - Raise the IPv6 neighbour table GC thresholds so a big pool / many parallel
+  #    upstream connections don't overflow the table ("neighbour table overflow").
+  tuning_options=(
+    "conf.$interface_name.accept_dad=0"
+    "conf.$interface_name.dad_transmits=0"
+    "neigh.default.gc_thresh1=4096"
+    "neigh.default.gc_thresh2=8192"
+    "neigh.default.gc_thresh3=16384"
+  );
+  for option in "${tuning_options[@]}"; do
+    full_option="net.ipv6.$option";
+    option_key="${full_option%%=*}";
+    if ! grep -v "#" /etc/sysctl.conf | grep -q "$option_key"; then echo "$full_option" >> /etc/sysctl.conf; fi;
+  done;
+
   sysctl -p &>> $script_log_file;
 
   if [[ $(cat /proc/sys/net/ipv6/conf/$interface_name/proxy_ndp) == 1 ]] && [[ $(cat /proc/sys/net/ipv6/ip_nonlocal_bind) == 1 ]]; then 
@@ -413,14 +461,12 @@ function create_network_persistence_service(){
   local service_name="ipv6-proxy-server-net";
   local service_path="/etc/systemd/system/$service_name.service";
 
-  # ndppd is only used (and only helps) in routed mode. In address mode it fights
-  # the kernel over NDP for the assigned addresses and makes some of them flaky,
-  # so keep it off there.
-  if $rotate_every_request; then
-    systemctl enable --now ndppd &>> $script_log_file;
-  else
-    systemctl disable --now ndppd &>> $script_log_file;
-  fi;
+  # ndppd answers NDP for the whole subnet. It is required for on-link subnets,
+  # and harmless for routed ones, so keep it running in every mode. (Because DAD
+  # is disabled on the interface, ndppd can no longer answer the host's own DAD
+  # probes - which used to make freshly assigned addresses fail - so it now
+  # coexists cleanly with address assignment.)
+  systemctl enable --now ndppd &>> $script_log_file;
 
   # Header (expanded now): the concrete values for this server.
   cat > $ensure_script_path <<EOF
@@ -445,22 +491,30 @@ reassert_once() {
   sysctl -qw "net.ipv6.conf.all.forwarding=1"               2>/dev/null
   sysctl -qw "net.ipv6.conf.default.forwarding=1"           2>/dev/null
   sysctl -qw "net.ipv6.ip_nonlocal_bind=1"                  2>/dev/null
+  # Keep DAD disabled on the proxy interface: a network-manager reconfigure can
+  # reset it, and re-enabled DAD would push freshly re-added pool addresses back
+  # into "tentative"/"dadfailed" and break their connectivity.
+  sysctl -qw "net.ipv6.conf.${interface_name}.accept_dad=0"    2>/dev/null
+  sysctl -qw "net.ipv6.conf.${interface_name}.dad_transmits=0" 2>/dev/null
 
-  if grep -q "true" "$ndppd_routing_file" 2>/dev/null; then
-    # Routed mode (only --rotate-every-request): one local route + ndppd.
-    ip -6 route replace local "${subnet_mask}::/${subnet}" dev "${interface_name}" 2>/dev/null
-    systemctl is-active --quiet ndppd 2>/dev/null || systemctl restart ndppd 2>/dev/null || service ndppd restart 2>/dev/null
-  else
-    # Address mode (default): make sure every pool address is on the interface,
-    # adding only the ones that are currently missing. Adds happen in one batched
-    # netlink transaction (ip -batch), so re-adding a large pool after a flush
-    # takes ~1s instead of one fork per address.
+  # Routed infrastructure is applied in EVERY mode: the local subnet route lets
+  # the host accept/bind the whole subnet (needed for routed subnets), and ndppd
+  # answers NDP for it (needed for on-link subnets). Both are harmless when not
+  # strictly required, so always assert them - this is what makes the proxy work
+  # regardless of how the provider hands out the subnet.
+  ip -6 route replace local "${subnet_mask}::/${subnet}" dev "${interface_name}" 2>/dev/null
+  systemctl is-active --quiet ndppd 2>/dev/null || systemctl restart ndppd 2>/dev/null || service ndppd restart 2>/dev/null
+
+  # In address mode (not a confirmed-routed subnet) also keep every pool address
+  # present on the interface, adding only the currently-missing ones in a single
+  # batched netlink transaction (fast even for a large pool after a flush).
+  if ! grep -q "true" "$ndppd_routing_file" 2>/dev/null; then
     [ -s "$random_ipv6_list_file" ] || return 0
     local assigned missing
     assigned="$(ip -6 addr show dev "${interface_name}" 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | sort -u)"
     missing="$(comm -23 <(sort -u "$random_ipv6_list_file") <(echo "$assigned"))"
     [ -n "$missing" ] || return 0
-    echo "$missing" | awk -v ifc="${interface_name}" 'NF{print "address add "$0" dev "ifc}' | ip -6 -force -batch - 2>/dev/null
+    echo "$missing" | awk -v ifc="${interface_name}" 'NF{print "address add "$0" dev "ifc" nodad"}' | ip -6 -force -batch - 2>/dev/null
   fi
 }
 
@@ -556,19 +610,38 @@ function create_startup_script(){
   is_auth_used;
   local use_auth=$?;
 
-  # Proxies use directly-assigned IPv6 addresses by default - this is reliable on
-  # every provider (the kernel itself answers NDP for assigned addresses). ndppd
-  # based subnet routing is only required for --rotate-every-request, so only
-  # probe it in that case. This also avoids a slow, noisy ndppd connectivity
-  # check on every normal install.
+  # Decide how the proxy pool reaches the network:
+  #
+  #  * "routed" mode (preferred): the provider routes the whole subnet to this
+  #    host, so ndppd answers NDP for the subnet and 3proxy binds ANY address in
+  #    it via ip_nonlocal_bind WITHOUT assigning thousands of addresses. This is
+  #    the most reliable mode - every address works, there is no per-address DAD,
+  #    and the network-manager has nothing extra to flush. We auto-detect it with
+  #    a real end-to-end connectivity probe (is_ndppd_routing_working).
+  #
+  #  * "address" mode (fallback): assign each generated address directly to the
+  #    interface (DAD disabled in configure_ipv6, added with "nodad"). Used when
+  #    the provider does NOT route the subnet to the host.
+  #
+  # NOTE: forcing address mode unconditionally (and disabling ndppd) is what broke
+  # connectivity for most pool addresses on routed subnets - hence the auto-detect.
+  routed_mode=false;
+  is_ndppd_routing_working;
+  if [ $? -eq 0 ]; then routed_mode=true; fi;
+
   if $try_rotate_every_request; then
-    is_ndppd_routing_working;
-    if [ $? -eq 0 ]; then
+    if $routed_mode; then
       echo "Rotation for every request is possible, starting config generation..."
       rotate_every_request=true;
     else
       log_err_and_exit "IP rotation for every request isn't possible for your server. Check logs, maybe it's a problem with your VPS provider";
     fi;
+  fi;
+
+  if $routed_mode; then
+    echo "Subnet is routed to this host - using reliable ndppd routed mode (no per-address assignment).";
+  else
+    echo "Subnet is not routed - using address mode (assigning pool addresses to the interface with DAD disabled).";
   fi;
 
   # Add main script that runs proxy server and rotates external ip's, if server is already running
@@ -595,7 +668,7 @@ function create_startup_script(){
   if test -f $ndppd_routing_file;
     then cp $ndppd_routing_file \$old_ndppd_routing_file;
   fi;
-  if $rotate_every_request; then echo "true" > $ndppd_routing_file; else echo "false" > $ndppd_routing_file; fi; 
+  if $routed_mode; then echo "true" > $ndppd_routing_file; else echo "false" > $ndppd_routing_file; fi;
 
   # Array with allowed symbols in hex (in ipv6 addresses)
   array=( 1 2 3 4 5 6 7 8 9 0 a b c d e f )
@@ -692,10 +765,15 @@ function create_startup_script(){
   # Script that adds all random ipv6 to default interface and runs backconnect proxy server
   ulimit -n 600000
   ulimit -u 600000
-  if $rotate_every_request; then
-    ip -6 route replace local $subnet_mask::/$subnet dev $interface_name 2>/dev/null
-  else
-    for ipv6_address in \$(cat ${random_ipv6_list_file}); do ip -6 addr add \$ipv6_address dev $interface_name 2>/dev/null; done; 
+  # Always install the local subnet route: routed subnets need it (lets the host
+  # bind/accept the whole subnet via ip_nonlocal_bind), and it is harmless when
+  # addresses are also assigned. ndppd additionally answers NDP for on-link subnets.
+  ip -6 route replace local $subnet_mask::/$subnet dev $interface_name 2>/dev/null
+  if ! $routed_mode; then
+    # Address mode: assign every pool address to the interface. "nodad" skips
+    # Duplicate Address Detection so the address is usable immediately and the
+    # kernel answers NDP for it (DAD is also disabled via sysctl in install).
+    for ipv6_address in \$(cat ${random_ipv6_list_file}); do ip -6 addr add \$ipv6_address dev $interface_name nodad 2>/dev/null; done;
   fi;
   ${user_home_dir}/proxyserver/3proxy/bin/3proxy ${proxyserver_config_path}
   sleep 2
@@ -848,14 +926,20 @@ check_startup_parameters;
 check_ipv6;
 backconnect_ipv4=$(get_backconnect_ipv4);
 subnet_mask=$(get_subnet_mask)
+# configure_ipv6 (sysctls: proxy_ndp, forwarding, ip_nonlocal_bind, DAD off,
+# neighbour table sizing) and configure_ndppd (ndppd.conf + local subnet route)
+# are cheap and idempotent, so run them on EVERY invocation - including a
+# reconfigure over an existing install. This guarantees the reliability sysctls
+# and ndppd are in place even when the user re-runs the script without
+# uninstalling first (previously these only ran on a clean install).
+configure_ipv6;
 if is_proxyserver_installed; then
   echo -e "Proxy server already installed, reconfiguring:\n";
 else
-  configure_ipv6;
   install_requred_packages;
   install_3proxy;
-  configure_ndppd;
 fi;
+configure_ndppd;
 generate_random_users_if_needed;
 create_startup_script;
 add_to_cron;
